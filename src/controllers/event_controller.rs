@@ -27,6 +27,7 @@ use crate::entities::{
 pub fn router() -> Router<DatabaseConnection> {
     Router::new()
         .route("/events", post(create_event).get(get_events))
+        .route("/events/check-availability", get(check_friends_availability))
         .route("/events/{id}", get(get_event))
         .route("/events/{id}/finish", post(finish_event))
         .route("/events/{id}/cancel", post(cancel_event))
@@ -263,6 +264,92 @@ pub async fn get_events(
     }
 
     Ok(Json(response))
+}
+
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+pub struct CheckAvailabilityQuery {
+    date: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/events/check-availability",
+    summary = "Проверить доступность друзей",
+    description = "Возвращает список друзей текущего пользователя, которые свободны в указанную дату (не забронированы на busyday).",
+    params(CheckAvailabilityQuery),
+    responses(
+        (status = 200, description = "Список доступных друзей", body = Vec<String>),
+        (status = 400, description = "Некорректный формат даты"),
+        (status = 401, description = "Не авторизован")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Events"
+)]
+pub async fn check_friends_availability(
+    auth: AuthUser,
+    State(db): State<DatabaseConnection>,
+    Query(q): Query<CheckAvailabilityQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let me = auth.user_id;
+    let date = parse_date(&q.date)?;
+
+    let accepted_friends = Friendship::find()
+        .filter(friendship::Column::Status.eq(FriendshipStatus::Accepted))
+        .filter(
+            Condition::any()
+                .add(friendship::Column::UserId.eq(me))
+                .add(friendship::Column::FriendId.eq(me)),
+        )
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
+
+    let friend_ids: Vec<Uuid> = accepted_friends
+        .iter()
+        .map(|f| if f.user_id == me { f.friend_id } else { f.user_id })
+        .collect();
+
+    if friend_ids.is_empty() {
+        return Ok(Json(serde_json::json!({ "available_friends": [] })));
+    }
+
+    let busy_user_ids = Busyday::find()
+        .filter(BusydayColumn::Date.eq(date))
+        .filter(BusydayColumn::UserId.is_in(friend_ids.clone()))
+        .all(&db)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|b| b.user_id)
+        .collect::<Vec<_>>();
+
+    let available_friends = crate::entities::user::Entity::find()
+        .filter(crate::entities::user::Column::Id.is_in(friend_ids))
+        .filter(
+            if busy_user_ids.is_empty() {
+                Condition::all()
+            } else {
+                Condition::all().add(crate::entities::user::Column::Id.is_not_in(busy_user_ids))
+            },
+        )
+        .order_by_asc(crate::entities::user::Column::Username)
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
+
+    let response: Vec<serde_json::Value> = available_friends
+        .into_iter()
+        .map(|user| {
+            serde_json::json!({
+                "id": user.id,
+                "username": user.username,
+                "avatar_url": user.avatar_url,
+                "bio": user.bio,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "available_friends": response })))
 }
 
 #[utoipa::path(
