@@ -10,6 +10,8 @@ pub struct CreateEventBody {
     pub title: String,
     pub description: Option<String>,
     pub location: Option<String>,
+    pub time: Option<String>,
+    #[serde(rename = "invited_friend_ids")]
     pub participant_ids: Vec<Uuid>,
     pub wish_place_id: Option<Uuid>,
 }

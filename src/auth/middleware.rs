@@ -16,12 +16,6 @@ where
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // TODO: disable in production
-        if let Some(debug_header) = parts.headers.get("DEBUG").and_then(|h| h.to_str().ok()) {
-            let id = Uuid::parse_str(debug_header)
-                .map_err(|_| (StatusCode::BAD_REQUEST, "invalid uuid"))?;
-            return Ok(AuthUser { user_id: id });
-        }
         let auth_header = parts
             .headers
             .get("Authorization")

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::auth::middleware::AuthUser;
 use crate::controllers::models::events::{
     CreateEventBody, EventResponse, EventScope, EventScopeQuery, FinishEventBody,
-    ParticipantResponse,
+    ParticipantResponse, UserAvailabilityResponse,
 };
 use crate::entities::event::EventStatus;
 use crate::entities::friendship::{self, FriendshipStatus};
@@ -27,6 +27,10 @@ use crate::entities::{
 pub fn router() -> Router<DatabaseConnection> {
     Router::new()
         .route("/events", post(create_event).get(get_events))
+        .route("/events/active", get(get_active_events))
+        .route("/events/pending", get(get_pending_events))
+        .route("/events/check-user-availability", get(check_user_availability))
+        .route("/events/check-availability", get(check_friends_availability))
         .route("/events/{id}", get(get_event))
         .route("/events/{id}/finish", post(finish_event))
         .route("/events/{id}/cancel", post(cancel_event))
@@ -263,6 +267,280 @@ pub async fn get_events(
     }
 
     Ok(Json(response))
+}
+
+#[utoipa::path(
+    get,
+    path = "/events/active",
+    summary = "Активные события",
+    description = "Возвращает события текущего пользователя, где ВСЕ участники (включая создателя) имеют статус accepted.",
+    responses(
+        (status = 200, description = "Список активных событий", body = [EventResponse]),
+        (status = 401, description = "Не авторизован")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Events"
+)]
+pub async fn get_active_events(
+    auth: AuthUser,
+    State(db): State<DatabaseConnection>,
+) -> Result<Json<Vec<EventResponse>>, (StatusCode, String)> {
+    let me = auth.user_id;
+    let today = Utc::now().date_naive();
+
+    let user_event_ids = UserEvent::find()
+        .filter(
+            Condition::any()
+                .add(UserEventColumn::UserId.eq(me))
+        )
+        .all(&db)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|row| row.event_id)
+        .collect::<Vec<_>>();
+
+    if user_event_ids.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let events = Event::find()
+        .filter(EventColumn::Id.is_in(user_event_ids))
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
+
+    let mut response = Vec::new();
+    for event in events {
+        if event.date < today {
+            let participants = load_participants(&db, event.id).await?;
+            let all_accepted = participants
+                .iter()
+                .all(|p| p.response_status == "accepted");
+
+            let new_status = if all_accepted {
+                EventStatus::Completed
+            } else {
+                EventStatus::Canceled
+            };
+
+            let mut active = event.into_active_model();
+            active.status = Set(new_status);
+            active.update(&db).await.map_err(internal_error)?;
+
+            continue;
+        }
+
+        let participants = load_participants(&db, event.id).await?;
+        let all_accepted = participants
+            .iter()
+            .all(|p| p.response_status == "accepted");
+
+        if all_accepted {
+            response.push(load_event_response(&db, event.id).await?);
+        }
+    }
+
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    get,
+    path = "/events/pending",
+    summary = "События с ожиданием",
+    description = "Возвращает события текущего пользователя, где НЕ все участники имеют статус accepted (т.е. хотя бы один ожидает или отклонил).",
+    responses(
+        (status = 200, description = "Список событий с ожиданием", body = [EventResponse]),
+        (status = 401, description = "Не авторизован")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Events"
+)]
+pub async fn get_pending_events(
+    auth: AuthUser,
+    State(db): State<DatabaseConnection>,
+) -> Result<Json<Vec<EventResponse>>, (StatusCode, String)> {
+    let me = auth.user_id;
+    let today = Utc::now().date_naive();
+
+    let user_event_ids = UserEvent::find()
+        .filter(
+            Condition::any()
+                .add(UserEventColumn::UserId.eq(me))
+        )
+        .all(&db)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|row| row.event_id)
+        .collect::<Vec<_>>();
+
+    if user_event_ids.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let events = Event::find()
+        .filter(EventColumn::Id.is_in(user_event_ids))
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
+
+    let mut response = Vec::new();
+    for event in events {
+        // Handle past events: check date and transition status if needed
+        if event.date < today {
+            let participants = load_participants(&db, event.id).await?;
+            let all_accepted = participants
+                .iter()
+                .all(|p| p.response_status == "accepted");
+
+            let new_status = if all_accepted {
+                EventStatus::Completed
+            } else {
+                EventStatus::Canceled
+            };
+
+            // Update event status in database
+            let mut active = event.into_active_model();
+            active.status = Set(new_status);
+            active.update(&db).await.map_err(internal_error)?;
+
+            // Skip past events from response
+            continue;
+        }
+
+        let participants = load_participants(&db, event.id).await?;
+        let all_accepted = participants
+            .iter()
+            .all(|p| p.response_status == "accepted");
+
+        if !all_accepted {
+            response.push(load_event_response(&db, event.id).await?);
+        }
+    }
+
+    Ok(Json(response))
+}
+
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+pub struct CheckAvailabilityQuery {
+    date: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/events/check-user-availability",
+    summary = "Проверить доступность текущего пользователя",
+    description = "Проверяет, свободен ли текущий пользователь в указанную дату (не забронирован на busyday).",
+    params(CheckAvailabilityQuery),
+    responses(
+        (status = 200, description = "Статус доступности пользователя", body = UserAvailabilityResponse),
+        (status = 400, description = "Некорректный формат даты"),
+        (status = 401, description = "Не авторизован")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Events"
+)]
+pub async fn check_user_availability(
+    auth: AuthUser,
+    State(db): State<DatabaseConnection>,
+    Query(q): Query<CheckAvailabilityQuery>,
+) -> Result<Json<UserAvailabilityResponse>, (StatusCode, String)> {
+    let me = auth.user_id;
+    let date = parse_date(&q.date)?;
+
+    let is_busy = Busyday::find()
+        .filter(BusydayColumn::UserId.eq(me))
+        .filter(BusydayColumn::Date.eq(date))
+        .one(&db)
+        .await
+        .map_err(internal_error)?
+        .is_some();
+
+    Ok(Json(UserAvailabilityResponse {
+        is_available: !is_busy,
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/events/check-availability",
+    summary = "Проверить доступность друзей",
+    description = "Возвращает список друзей текущего пользователя, которые свободны в указанную дату (не забронированы на busyday).",
+    params(CheckAvailabilityQuery),
+    responses(
+        (status = 200, description = "Список доступных друзей", body = Vec<String>),
+        (status = 400, description = "Некорректный формат даты"),
+        (status = 401, description = "Не авторизован")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Events"
+)]
+pub async fn check_friends_availability(
+    auth: AuthUser,
+    State(db): State<DatabaseConnection>,
+    Query(q): Query<CheckAvailabilityQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let me = auth.user_id;
+    let date = parse_date(&q.date)?;
+
+    let accepted_friends = Friendship::find()
+        .filter(friendship::Column::Status.eq(FriendshipStatus::Accepted))
+        .filter(
+            Condition::any()
+                .add(friendship::Column::UserId.eq(me))
+                .add(friendship::Column::FriendId.eq(me)),
+        )
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
+
+    let friend_ids: Vec<Uuid> = accepted_friends
+        .iter()
+        .map(|f| if f.user_id == me { f.friend_id } else { f.user_id })
+        .collect();
+
+    if friend_ids.is_empty() {
+        return Ok(Json(serde_json::json!({ "available_friends": [] })));
+    }
+
+    let busy_user_ids = Busyday::find()
+        .filter(BusydayColumn::Date.eq(date))
+        .filter(BusydayColumn::UserId.is_in(friend_ids.clone()))
+        .all(&db)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|b| b.user_id)
+        .collect::<Vec<_>>();
+
+    let available_friends = crate::entities::user::Entity::find()
+        .filter(crate::entities::user::Column::Id.is_in(friend_ids))
+        .filter(
+            if busy_user_ids.is_empty() {
+                Condition::all()
+            } else {
+                Condition::all().add(crate::entities::user::Column::Id.is_not_in(busy_user_ids))
+            },
+        )
+        .order_by_asc(crate::entities::user::Column::Username)
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
+
+    let response: Vec<serde_json::Value> = available_friends
+        .into_iter()
+        .map(|user| {
+            serde_json::json!({
+                "id": user.id,
+                "username": user.username,
+                "avatar_url": user.avatar_url,
+                "bio": user.bio,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "available_friends": response })))
 }
 
 #[utoipa::path(
