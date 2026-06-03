@@ -32,13 +32,14 @@ pub fn router() -> Router<DatabaseConnection> {
 #[utoipa::path(
     get,
     path = "/wish-places",
-    summary = "Список wish places пользователя",
-    description = "Возвращает места из wish list пользователя `user_id`. Доступ: сам пользователь или принятый друг.",
+    summary = "Get wish places",
+    description = "Returns wish places for the specified user. Access: self or accepted friend only.",
     params(WishPlaceQuery),
     responses(
-        (status = 200, description = "Список мест", body = [WishPlaceResponse]),
-        (status = 401, description = "Не авторизован"),
-        (status = 403, description = "Нет доступа")
+        (status = 200, description = "Wish places list retrieved successfully", body = [WishPlaceResponse]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 403, description = "Forbidden: you can only view your own or accepted friend's wish places"),
+        (status = 500, description = "Server error: failed to retrieve wish places")
     ),
     security(("bearer_auth" = [])),
     tag = "WishPlaces"
@@ -50,7 +51,7 @@ pub async fn get_wish_places(
 ) -> Result<Json<Vec<WishPlaceResponse>>, (StatusCode, String)> {
     let me = auth.user_id;
     if me != query.user_id && !are_users_accepted_friends(&db, me, query.user_id).await? {
-        return Err((StatusCode::FORBIDDEN, "access denied".to_string()));
+        return Err((StatusCode::FORBIDDEN, "You can only view your own or accepted friend's wish places.".to_string()));
     }
 
     let rows = WishPlace::find()
@@ -66,13 +67,14 @@ pub async fn get_wish_places(
 #[utoipa::path(
     post,
     path = "/wish-places",
-    summary = "Создать wish place",
-    description = "Создает место в wish list текущего пользователя.",
+    summary = "Create wish place",
+    description = "Creates a new place in current user's wish list.",
     request_body = CreateWishPlaceBody,
     responses(
-        (status = 201, description = "Место создано", body = WishPlaceResponse),
-        (status = 400, description = "Некорректные данные"),
-        (status = 401, description = "Не авторизован")
+        (status = 201, description = "Wish place created successfully", body = WishPlaceResponse),
+        (status = 400, description = "Validation error: title is required"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to create wish place")
     ),
     security(("bearer_auth" = [])),
     tag = "WishPlaces"
@@ -83,7 +85,7 @@ pub async fn create_wish_place(
     Json(body): Json<CreateWishPlaceBody>,
 ) -> Result<(StatusCode, Json<WishPlaceResponse>), (StatusCode, String)> {
     if body.title.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "title is required".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "Please enter a title for the wish place.".to_string()));
     }
 
     let model = WishPlaceActiveModel {
@@ -106,15 +108,16 @@ pub async fn create_wish_place(
 #[utoipa::path(
     patch,
     path = "/wish-places/{id}",
-    summary = "Обновить wish place",
-    description = "Обновляет поля места в wish list. Только владелец.",
+    summary = "Update wish place",
+    description = "Updates wish place details. Owner only.",
     request_body = UpdateWishPlaceBody,
-    params(("id" = Uuid, Path, description = "ID места")),
+    params(("id" = Uuid, Path, description = "Wish place ID")),
     responses(
-        (status = 200, description = "Место обновлено", body = WishPlaceResponse),
-        (status = 400, description = "Некорректные данные"),
-        (status = 401, description = "Не авторизован"),
-        (status = 404, description = "Место не найдено")
+        (status = 200, description = "Wish place updated successfully", body = WishPlaceResponse),
+        (status = 400, description = "Validation error: title cannot be empty or nothing to update"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Wish place not found or you are not the owner"),
+        (status = 500, description = "Server error: failed to update wish place")
     ),
     security(("bearer_auth" = [])),
     tag = "WishPlaces"
@@ -130,7 +133,7 @@ pub async fn update_wish_place(
         .one(&db)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "wish place not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "Wish place not found or you are not the owner.".to_string()))?;
 
     if body.title.is_none()
         && body.description.is_none()
@@ -138,14 +141,14 @@ pub async fn update_wish_place(
         && body.link.is_none()
         && body.status.is_none()
     {
-        return Err((StatusCode::BAD_REQUEST, "nothing to update".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "Please provide at least one field to update.".to_string()));
     }
 
     let mut active = row.into_active_model();
 
     if let Some(title) = body.title {
         if title.trim().is_empty() {
-            return Err((StatusCode::BAD_REQUEST, "title cannot be empty".to_string()));
+            return Err((StatusCode::BAD_REQUEST, "Title cannot be empty.".to_string()));
         }
         active.title = Set(title);
     }
@@ -172,15 +175,16 @@ pub async fn update_wish_place(
 #[utoipa::path(
     post,
     path = "/wish-places/{id}/visit",
-    summary = "Отметить wish place как visited",
-    description = "Отмечает место как visited и привязывает к событию `event_id`. Только владелец. Пользователь должен быть creator события.",
+    summary = "Mark wish place as visited",
+    description = "Marks wish place as visited and associates with event. Owner and event creator only.",
     request_body = VisitWishPlaceBody,
-    params(("id" = Uuid, Path, description = "ID места")),
+    params(("id" = Uuid, Path, description = "Wish place ID")),
     responses(
-        (status = 200, description = "Место отмечено как visited", body = WishPlaceResponse),
-        (status = 401, description = "Не авторизован"),
-        (status = 404, description = "Место или событие не найдено"),
-        (status = 403, description = "Только creator события может отметить place как visited")
+        (status = 200, description = "Wish place marked as visited", body = WishPlaceResponse),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 403, description = "Forbidden: only event creator can mark place as visited"),
+        (status = 404, description = "Wish place or event not found"),
+        (status = 500, description = "Server error: failed to mark wish place as visited")
     ),
     security(("bearer_auth" = [])),
     tag = "WishPlaces"
@@ -196,18 +200,18 @@ pub async fn visit_wish_place(
         .one(&db)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "wish place not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "Wish place not found or you are not the owner.".to_string()))?;
 
     let event = Event::find_by_id(body.event_id)
         .one(&db)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "event not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "Event not found.".to_string()))?;
 
     if event.creator_id != auth.user_id {
         return Err((
             StatusCode::FORBIDDEN,
-            "only event creator can mark wish place as visited".to_string(),
+            "Only the event creator can mark a place as visited.".to_string(),
         ));
     }
 
@@ -222,13 +226,14 @@ pub async fn visit_wish_place(
 #[utoipa::path(
     delete,
     path = "/wish-places/{id}",
-    summary = "Архивировать wish place",
-    description = "Архивирует место (status=archived). Только владелец.",
-    params(("id" = Uuid, Path, description = "ID места")),
+    summary = "Archive wish place",
+    description = "Archives wish place (status=archived). Owner only.",
+    params(("id" = Uuid, Path, description = "Wish place ID")),
     responses(
-        (status = 204, description = "Место архивировано"),
-        (status = 401, description = "Не авторизован"),
-        (status = 404, description = "Место не найдено")
+        (status = 204, description = "Wish place archived successfully"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Wish place not found or you are not the owner"),
+        (status = 500, description = "Server error: failed to archive wish place")
     ),
     security(("bearer_auth" = [])),
     tag = "WishPlaces"
@@ -243,7 +248,7 @@ pub async fn delete_wish_place(
         .one(&db)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "wish place not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "Wish place not found or you are not the owner.".to_string()))?;
 
     let mut active = row.into_active_model();
     active.status = Set(WishPlaceStatus::Archived);
@@ -300,6 +305,6 @@ async fn are_users_accepted_friends(
     Ok(row.is_some())
 }
 
-fn internal_error<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+fn internal_error<E: std::fmt::Display>(_e: E) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
 }

@@ -30,8 +30,9 @@ pub fn router() -> Router<DatabaseConnection> {
     get,
     path = "/friends",
     responses(
-        (status = 200, description = "Current user's accepted friends", body = [UserDTO]),
-        (status = 401, description = "Unauthorized")
+        (status = 200, description = "List of accepted friends retrieved successfully", body = [UserDTO]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to retrieve friends list")
     ),
     security(
         ("bearer_auth" = [])
@@ -84,8 +85,9 @@ pub async fn get_friends(
     get,
     path = "/friends/incoming",
     responses(
-        (status = 200, description = "Incoming friend requests", body = [UserDTO]),
-        (status = 401, description = "Unauthorized")
+        (status = 200, description = "List of incoming friend requests retrieved successfully", body = [UserDTO]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to retrieve incoming requests")
     ),
     security(
         ("bearer_auth" = [])
@@ -125,8 +127,9 @@ pub async fn get_incoming(
     get,
     path = "/friends/outgoing",
     responses(
-        (status = 200, description = "Outgoing friend requests", body = [UserDTO]),
-        (status = 401, description = "Unauthorized")
+        (status = 200, description = "List of outgoing friend requests retrieved successfully", body = [UserDTO]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to retrieve outgoing requests")
     ),
     security(
         ("bearer_auth" = [])
@@ -167,9 +170,10 @@ pub async fn get_outgoing(
     path = "/friends/request",
     request_body = FriendIdBody,
     responses(
-        (status = 201, description = "Friend request created"),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized")
+        (status = 201, description = "Friend request sent successfully"),
+        (status = 400, description = "Validation error: cannot add yourself as a friend"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to create friend request")
     ),
     security(
         ("bearer_auth" = [])
@@ -183,7 +187,7 @@ pub async fn friend_request(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let me = auth.user_id;
     if body.friend_id == me {
-        return Err((StatusCode::BAD_REQUEST, "cannot add yourself".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "You cannot add yourself as a friend.".to_string()));
     }
 
     let frindship_active = FriendshipActive {
@@ -204,13 +208,14 @@ pub async fn friend_request(
     delete,
     path = "/friends/{id}/remove",
     params(
-        ("id" = Uuid, Path, description = "Friend user id")
+        ("id" = Uuid, Path, description = "Friend user ID")
     ),
     responses(
-        (status = 204, description = "Friend removed"),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Friendship not found")
+        (status = 204, description = "Friend removed successfully"),
+        (status = 400, description = "Validation error: cannot remove yourself as a friend"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Friendship not found: no accepted friendship exists with this user"),
+        (status = 500, description = "Server error: failed to remove friend")
     ),
     security(
         ("bearer_auth" = [])
@@ -226,7 +231,7 @@ pub async fn remove_friend(
     if me == friend_id {
         return Err((
             StatusCode::BAD_REQUEST,
-            "cannot remove yourself".to_string(),
+            "You cannot remove yourself.".to_string(),
         ));
     }
     let result = Friendship::delete_many()
@@ -248,7 +253,7 @@ pub async fn remove_friend(
         .await
         .map_err(internal_error)?;
     if result.rows_affected == 0 {
-        return Err((StatusCode::NOT_FOUND, "friendship not found".to_string()));
+        return Err((StatusCode::NOT_FOUND, "This friendship does not exist.".to_string()));
     };
 
     Ok(StatusCode::NO_CONTENT)
@@ -258,13 +263,14 @@ pub async fn remove_friend(
     post,
     path = "/friends/{id}/accept",
     params(
-        ("id" = Uuid, Path, description = "Sender user id")
+        ("id" = Uuid, Path, description = "Sender user ID")
     ),
     responses(
-        (status = 204, description = "Friend request accepted"),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Request not found")
+        (status = 204, description = "Friend request accepted successfully"),
+        (status = 400, description = "Validation error: cannot accept request from yourself"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Request not found: no pending friend request from this user"),
+        (status = 500, description = "Server error: failed to accept friend request")
     ),
     security(
         ("bearer_auth" = [])
@@ -281,7 +287,7 @@ pub async fn accept_friend_request(
     if sender_user_id == me {
         return Err((
             StatusCode::BAD_REQUEST,
-            "cannot accept yourself".to_string(),
+            "You cannot accept your own request.".to_string(),
         ));
     }
 
@@ -294,7 +300,7 @@ pub async fn accept_friend_request(
         .map_err(internal_error)?;
 
     let Some(row) = row else {
-        return Err((StatusCode::NOT_FOUND, "request not found".to_string()));
+        return Err((StatusCode::NOT_FOUND, "This friend request does not exist.".to_string()));
     };
 
     let mut active = row.into_active_model();
@@ -312,13 +318,14 @@ pub async fn accept_friend_request(
     post,
     path = "/friends/{id}/reject",
     params(
-        ("id" = Uuid, Path, description = "Sender user id")
+        ("id" = Uuid, Path, description = "Sender user ID")
     ),
     responses(
-        (status = 204, description = "Friend request rejected"),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Request not found")
+        (status = 204, description = "Friend request rejected successfully"),
+        (status = 400, description = "Validation error: cannot reject request from yourself"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Request not found: no pending friend request from this user"),
+        (status = 500, description = "Server error: failed to reject friend request")
     ),
     security(
         ("bearer_auth" = [])
@@ -334,7 +341,7 @@ pub async fn reject_friend_request(
     if sender_user_id == me {
         return Err((
             StatusCode::BAD_REQUEST,
-            "cannot reject yourself".to_string(),
+            "You cannot reject your own request.".to_string(),
         ));
     }
 
@@ -347,7 +354,7 @@ pub async fn reject_friend_request(
         .map_err(internal_error)?;
 
     let Some(row) = row else {
-        return Err((StatusCode::NOT_FOUND, "request not found".to_string()));
+        return Err((StatusCode::NOT_FOUND, "This friend request does not exist.".to_string()));
     };
 
     row.into_active_model()
@@ -359,8 +366,8 @@ pub async fn reject_friend_request(
 }
 
 // MARK: Helper methods
-fn internal_error<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+fn internal_error<E: std::fmt::Display>(_e: E) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
 }
 
 fn to_user_dto(u: &user::Model) -> UserDTO {

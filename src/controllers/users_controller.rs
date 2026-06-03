@@ -23,14 +23,14 @@ pub fn router() -> Router<DatabaseConnection> {
     get,
     path = "/users/me",
     responses(
-        (status = 200, description = "Current user profile", body = UserResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "User not found")
+        (status = 200, description = "Current user profile retrieved successfully", body = UserResponse),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "User profile not found")
     ),
     security(
         ("bearer_auth" = [])
     ),
-    tag = "user_routes"
+    tag = "Users"
 )]
 pub async fn get_me(
     auth_user: AuthUser,
@@ -41,10 +41,10 @@ pub async fn get_me(
     let model = User::find_by_id(user_id)
         .one(&db_connection)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Unable to retrieve your profile. Please try again.".to_string()))?;
 
     let Some(model) = model else {
-        return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+        return Err((StatusCode::NOT_FOUND, "Your profile could not be found.".to_string()));
     };
 
     Ok(Json(UserResponse {
@@ -60,9 +60,10 @@ pub async fn get_me(
     path = "/users/me",
     request_body = UpdateUserRequestBody,
     responses(
-        (status = 200, description = "Updated current user profile", body = UserResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 404, description = "User not found")
+        (status = 200, description = "User profile updated successfully", body = UserResponse),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "User profile not found"),
+        (status = 500, description = "Server error: failed to update profile")
     ),
     security(
         ("bearer_auth" = [])
@@ -79,10 +80,10 @@ pub async fn update_me(
     let model = User::find_by_id(user_id)
         .one(&db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Unable to retrieve your profile. Please try again.".to_string()))?;
 
     let Some(model) = model else {
-        return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+        return Err((StatusCode::NOT_FOUND, "Your profile could not be found.".to_string()));
     };
 
     let mut active: UserActiveModel = model.into();
@@ -100,7 +101,7 @@ pub async fn update_me(
     let model = active
         .update(&db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to update profile. Please try again.".to_string()))?;
 
     Ok(Json(UserResponse {
         id: model.id,
@@ -114,11 +115,11 @@ pub async fn update_me(
     get,
     path = "/users/{id}",
     params(
-        ("id" = Uuid, Path, description = "User id")
+        ("id" = Uuid, Path, description = "User ID")
     ),
     responses(
-        (status = 200, description = "User profile by id", body = UserResponse),
-        (status = 404, description = "User not found")
+        (status = 200, description = "User profile retrieved successfully", body = UserResponse),
+        (status = 404, description = "User not found: no user with the specified ID exists")
     ),
     tag = "Users"
 )]
@@ -129,10 +130,10 @@ pub async fn get_user_by_id(
     let model = User::find_by_id(id)
         .one(&db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Unable to retrieve user profile. Please try again.".to_string()))?;
 
     let Some(model) = model else {
-        return Err((StatusCode::NOT_FOUND, "user not found".to_string()));
+        return Err((StatusCode::NOT_FOUND, "This user profile does not exist.".to_string()));
     };
 
     Ok(Json(UserResponse {
@@ -149,7 +150,8 @@ pub async fn get_user_by_id(
     params(UserNameSearchQuery),
     responses(
         (status = 200, description = "Users found by username prefix", body = [UserResponse]),
-        (status = 400, description = "Query is invalid")
+        (status = 400, description = "Validation error: username query parameter is required"),
+        (status = 500, description = "Server error: failed to search users")
     ),
     tag = "Users"
 )]
@@ -159,10 +161,9 @@ pub async fn search_users(
 ) -> Result<Json<Vec<UserResponse>>, (StatusCode, String)> {
     let username = query.username.unwrap_or_default();
     if username.trim().is_empty() {
-        // TODO: возможно просто вернуть пустой vec
         return Err((
             StatusCode::BAD_REQUEST,
-            "username query required".to_string(),
+            "Please enter a username to search.".to_string(),
         ));
     }
 
@@ -170,7 +171,7 @@ pub async fn search_users(
         .filter(UserColumn::Username.starts_with(username))
         .all(&db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to search users. Please try again.".to_string()))?;
 
     let users = models
         .into_iter()

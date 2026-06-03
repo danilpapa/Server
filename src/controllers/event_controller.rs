@@ -29,6 +29,7 @@ pub fn router() -> Router<DatabaseConnection> {
         .route("/events", post(create_event).get(get_events))
         .route("/events/active", get(get_active_events))
         .route("/events/pending", get(get_pending_events))
+        .route("/events/waiting", get(get_waiting_events))
         .route("/events/check-user-availability", get(check_user_availability))
         .route("/events/check-availability", get(check_friends_availability))
         .route("/events/{id}", get(get_event))
@@ -42,14 +43,16 @@ pub fn router() -> Router<DatabaseConnection> {
 #[utoipa::path(
     post,
     path = "/events",
-    summary = "Создать событие",
-    description = "Создает событие на один день. Автор берется из auth и сразу получает статус accepted (role=owner). Участники из participant_ids добавляются как role=participant со статусом pending. Можно приглашать только принятых друзей.",
+    summary = "Create event",
+    description = "Creates an event for a single day. Current user becomes the event owner with accepted status. Participants are added with pending status. Can only invite accepted friends.",
     request_body = CreateEventBody,
     responses(
-        (status = 201, description = "Событие создано", body = EventResponse),
-        (status = 400, description = "Некорректные данные"),
-        (status = 401, description = "Не авторизован"),
-        (status = 403, description = "Можно приглашать только друзей")
+        (status = 201, description = "Event created successfully", body = EventResponse),
+        (status = 400, description = "Validation error: title is required"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 403, description = "Forbidden: can invite only accepted friends"),
+        (status = 409, description = "Conflict: one or more participants are busy on the selected date"),
+        (status = 500, description = "Server error: failed to create event")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -63,7 +66,7 @@ pub async fn create_event(
     let date = parse_date(&body.date)?;
 
     if body.title.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "title is required".to_string()));
+        return Err((StatusCode::BAD_REQUEST, "Please enter an event title.".to_string()));
     }
 
     let mut participant_ids = body.participant_ids;
@@ -75,7 +78,7 @@ pub async fn create_event(
         if !are_users_accepted_friends(&db, me, *participant_id).await? {
             return Err((
                 StatusCode::FORBIDDEN,
-                "can invite only accepted friends".to_string(),
+                "You can only invite accepted friends to events.".to_string(),
             ));
         }
     }
@@ -87,7 +90,7 @@ pub async fn create_event(
             if status == StatusCode::CONFLICT {
                 return Err((
                     StatusCode::CONFLICT,
-                    format!("participant {participant_id} is busy on selected day"),
+                    "One or more participants are already busy on this date.".to_string(),
                 ));
             }
             return Err((status, message));
@@ -157,14 +160,14 @@ pub async fn create_event(
 #[utoipa::path(
     get,
     path = "/events/{id}",
-    summary = "Получить событие",
-    description = "Возвращает событие по id вместе с участниками из user_events. Доступ: только участник события.",
-    params(("id" = Uuid, Path, description = "ID события")),
+    summary = "Get event details",
+    description = "Returns event data with participants. Access restricted to event participants only.",
+    params(("id" = Uuid, Path, description = "Event ID")),
     responses(
-        (status = 200, description = "Данные события", body = EventResponse),
-        (status = 401, description = "Не авторизован"),
-        (status = 403, description = "Нет доступа"),
-        (status = 404, description = "Событие не найдено")
+        (status = 200, description = "Event details retrieved successfully", body = EventResponse),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 403, description = "Forbidden: you are not a participant in this event"),
+        (status = 404, description = "Event not found")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -176,18 +179,20 @@ pub async fn get_event(
 ) -> Result<Json<EventResponse>, (StatusCode, String)> {
     let me = auth.user_id;
     ensure_event_access(&db, id, me).await?;
-    Ok(Json(load_event_response(&db, id).await?))
+    let event = load_event_response(&db, id).await.map_err(|_| (StatusCode::NOT_FOUND, "Event not found.".to_string()))?;
+    Ok(Json(event))
 }
 
 #[utoipa::path(
     get,
     path = "/events",
-    summary = "Список событий",
-    description = "Возвращает события текущего пользователя. scope: created | invited | upcoming | past.",
+    summary = "List events",
+    description = "Returns events for the current user filtered by scope (created, invited, upcoming, past).",
     params(EventScopeQuery),
     responses(
-        (status = 200, description = "Список событий", body = [EventResponse]),
-        (status = 401, description = "Не авторизован")
+        (status = 200, description = "Events list retrieved successfully", body = [EventResponse]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to retrieve events")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -212,6 +217,7 @@ pub async fn get_events(
             let event_ids = UserEvent::find()
                 .filter(UserEventColumn::UserId.eq(me))
                 .filter(UserEventColumn::Role.eq(UserEventRole::Participant))
+                .filter(UserEventColumn::ResponseStatus.ne(UserEventResponse::Declined))
                 .all(&db)
                 .await
                 .map_err(internal_error)?
@@ -272,11 +278,12 @@ pub async fn get_events(
 #[utoipa::path(
     get,
     path = "/events/active",
-    summary = "Активные события",
-    description = "Возвращает события текущего пользователя, где ВСЕ участники (включая создателя) имеют статус accepted.",
+    summary = "Get active events",
+    description = "Returns events where all participants (including creator) have accepted status.",
     responses(
-        (status = 200, description = "Список активных событий", body = [EventResponse]),
-        (status = 401, description = "Не авторизован")
+        (status = 200, description = "Active events retrieved successfully", body = [EventResponse]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to retrieve active events")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -293,6 +300,7 @@ pub async fn get_active_events(
             Condition::any()
                 .add(UserEventColumn::UserId.eq(me))
         )
+        .filter(UserEventColumn::ResponseStatus.ne(UserEventResponse::Declined))
         .all(&db)
         .await
         .map_err(internal_error)?
@@ -347,11 +355,12 @@ pub async fn get_active_events(
 #[utoipa::path(
     get,
     path = "/events/pending",
-    summary = "События с ожиданием",
-    description = "Возвращает события текущего пользователя, где НЕ все участники имеют статус accepted (т.е. хотя бы один ожидает или отклонил).",
+    summary = "Get pending events",
+    description = "Returns events where current user has accepted and event status is pending (waiting for others).",
     responses(
-        (status = 200, description = "Список событий с ожиданием", body = [EventResponse]),
-        (status = 401, description = "Не авторизован")
+        (status = 200, description = "Pending events retrieved successfully", body = [EventResponse]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to retrieve pending events")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -361,62 +370,98 @@ pub async fn get_pending_events(
     State(db): State<DatabaseConnection>,
 ) -> Result<Json<Vec<EventResponse>>, (StatusCode, String)> {
     let me = auth.user_id;
-    let today = Utc::now().date_naive();
 
-    let user_event_ids = UserEvent::find()
-        .filter(
-            Condition::any()
-                .add(UserEventColumn::UserId.eq(me))
-        )
-        .all(&db)
-        .await
-        .map_err(internal_error)?
-        .into_iter()
-        .map(|row| row.event_id)
-        .collect::<Vec<_>>();
-
-    if user_event_ids.is_empty() {
-        return Ok(Json(Vec::new()));
-    }
-
-    let events = Event::find()
-        .filter(EventColumn::Id.is_in(user_event_ids))
+    // Find all events where:
+    // 1. Current user is a participant with response_status == ACCEPTED
+    // 2. Event status == PENDING
+    let user_events = UserEvent::find()
+        .filter(UserEventColumn::UserId.eq(me))
+        .filter(UserEventColumn::ResponseStatus.eq(UserEventResponse::Accepted))
         .all(&db)
         .await
         .map_err(internal_error)?;
 
-    let mut response = Vec::new();
+    if user_events.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let event_ids = user_events
+        .into_iter()
+        .map(|row| row.event_id)
+        .collect::<Vec<_>>();
+
+    let events = Event::find()
+        .filter(EventColumn::Id.is_in(event_ids))
+        .filter(EventColumn::Status.eq(EventStatus::Pending))
+        .order_by_asc(EventColumn::Date)
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
+
+    let mut response = Vec::with_capacity(events.len());
     for event in events {
-        // Handle past events: check date and transition status if needed
-        if event.date < today {
-            let participants = load_participants(&db, event.id).await?;
-            let all_accepted = participants
-                .iter()
-                .all(|p| p.response_status == "accepted");
+        response.push(load_event_response(&db, event.id).await?);
+    }
 
-            let new_status = if all_accepted {
-                EventStatus::Completed
-            } else {
-                EventStatus::Canceled
-            };
+    Ok(Json(response))
+}
 
-            // Update event status in database
-            let mut active = event.into_active_model();
-            active.status = Set(new_status);
-            active.update(&db).await.map_err(internal_error)?;
+#[utoipa::path(
+    get,
+    path = "/events/waiting",
+    summary = "Get events awaiting response",
+    description = "Returns events where current user is a participant and has not yet accepted the invitation.",
+    responses(
+        (status = 200, description = "Events awaiting response retrieved successfully", body = [EventResponse]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to retrieve events")
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Events"
+)]
+pub async fn get_waiting_events(
+    auth: AuthUser,
+    State(db): State<DatabaseConnection>,
+) -> Result<Json<Vec<EventResponse>>, (StatusCode, String)> {
+    let me = auth.user_id;
+    let today = Utc::now().date_naive();
 
-            // Skip past events from response
-            continue;
-        }
+    // Find all user_events where:
+    // 1. user_id == me
+    // 2. role == Participant
+    // 3. response_status != Accepted AND != Declined
+    let user_events = UserEvent::find()
+        .filter(UserEventColumn::UserId.eq(me))
+        .filter(UserEventColumn::Role.eq(UserEventRole::Participant))
+        .filter(UserEventColumn::ResponseStatus.ne(UserEventResponse::Accepted))
+        .filter(UserEventColumn::ResponseStatus.ne(UserEventResponse::Declined))
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
 
-        let participants = load_participants(&db, event.id).await?;
-        let all_accepted = participants
-            .iter()
-            .all(|p| p.response_status == "accepted");
+    if user_events.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
 
-        if !all_accepted {
-            response.push(load_event_response(&db, event.id).await?);
-        }
+    let event_ids = user_events
+        .into_iter()
+        .map(|row| row.event_id)
+        .collect::<Vec<_>>();
+
+    // Load events and filter out past events
+    let events = Event::find()
+        .filter(EventColumn::Id.is_in(event_ids))
+        .filter(EventColumn::Date.gte(today))
+        .filter(EventColumn::Status.ne(EventStatus::Canceled))
+        .filter(EventColumn::Status.ne(EventStatus::Completed))
+        .order_by_asc(EventColumn::Date)
+        .all(&db)
+        .await
+        .map_err(internal_error)?;
+
+    let mut response = Vec::with_capacity(events.len());
+    for event in events {
+        response.push(load_event_response(&db, event.id).await?);
     }
 
     Ok(Json(response))
@@ -430,13 +475,14 @@ pub struct CheckAvailabilityQuery {
 #[utoipa::path(
     get,
     path = "/events/check-user-availability",
-    summary = "Проверить доступность текущего пользователя",
-    description = "Проверяет, свободен ли текущий пользователь в указанную дату (не забронирован на busyday).",
+    summary = "Check current user availability",
+    description = "Checks if current user is available on the specified date.",
     params(CheckAvailabilityQuery),
     responses(
-        (status = 200, description = "Статус доступности пользователя", body = UserAvailabilityResponse),
-        (status = 400, description = "Некорректный формат даты"),
-        (status = 401, description = "Не авторизован")
+        (status = 200, description = "User availability status retrieved", body = UserAvailabilityResponse),
+        (status = 400, description = "Validation error: invalid date format (use YYYY-MM-DD)"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to check availability")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -465,13 +511,14 @@ pub async fn check_user_availability(
 #[utoipa::path(
     get,
     path = "/events/check-availability",
-    summary = "Проверить доступность друзей",
-    description = "Возвращает список друзей текущего пользователя, которые свободны в указанную дату (не забронированы на busyday).",
+    summary = "Check friends availability",
+    description = "Returns list of friends available on the specified date.",
     params(CheckAvailabilityQuery),
     responses(
-        (status = 200, description = "Список доступных друзей", body = Vec<String>),
-        (status = 400, description = "Некорректный формат даты"),
-        (status = 401, description = "Не авторизован")
+        (status = 200, description = "Available friends list retrieved", body = serde_json::Value),
+        (status = 400, description = "Validation error: invalid date format (use YYYY-MM-DD)"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to check friends availability")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -546,16 +593,17 @@ pub async fn check_friends_availability(
 #[utoipa::path(
     post,
     path = "/events/{id}/finish",
-    summary = "Завершить событие",
-    description = "Ставит `status=completed` и сохраняет `memory_image_base64`. Только creator. Разрешено только в дату события или позже.",
+    summary = "Complete event",
+    description = "Marks event as completed with a memory image. Only creator can complete. Must be on or after event date.",
     request_body = FinishEventBody,
-    params(("id" = Uuid, Path, description = "ID события")),
+    params(("id" = Uuid, Path, description = "Event ID")),
     responses(
-        (status = 200, description = "Событие завершено", body = EventResponse),
-        (status = 400, description = "Пустой memory_image_base64"),
-        (status = 401, description = "Не авторизован"),
-        (status = 404, description = "Событие не найдено или не принадлежит creator"),
-        (status = 409, description = "Событие нельзя завершить до даты события или оно уже canceled/completed")
+        (status = 200, description = "Event completed successfully", body = EventResponse),
+        (status = 400, description = "Validation error: memory image cannot be empty"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Event not found or you are not the creator"),
+        (status = 409, description = "Conflict: event cannot be completed before event date or is already completed/canceled"),
+        (status = 500, description = "Server error: failed to complete event")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -574,26 +622,26 @@ pub async fn finish_event(
         .one(&db)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "event not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "Event not found or you are not the creator.".to_string()))?;
 
     if matches!(event.status, EventStatus::Canceled | EventStatus::Completed) {
         return Err((
             StatusCode::CONFLICT,
-            "event already canceled/completed".to_string(),
+            "This event has already been completed or canceled.".to_string(),
         ));
     }
 
     if today < event.date {
         return Err((
             StatusCode::CONFLICT,
-            "event can be completed only on/after event date".to_string(),
+            "You can only complete an event on or after the event date.".to_string(),
         ));
     }
 
     if body.memory_image_base64.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "memory_image_base64 cannot be empty".to_string(),
+            "Please add a memory image to complete the event.".to_string(),
         ));
     }
 
@@ -608,14 +656,15 @@ pub async fn finish_event(
 #[utoipa::path(
     post,
     path = "/events/{id}/cancel",
-    summary = "Отменить событие",
-    description = "Только creator. Полностью удаляет событие, связанные user_events и очищает busyday по event_id у всех участников.",
-    params(("id" = Uuid, Path, description = "ID события")),
+    summary = "Cancel event",
+    description = "Cancels and deletes event. Only creator can cancel. Removes all participant reservations.",
+    params(("id" = Uuid, Path, description = "Event ID")),
     responses(
-        (status = 204, description = "Событие отменено"),
-        (status = 401, description = "Не авторизован"),
-        (status = 404, description = "Событие не найдено"),
-        (status = 409, description = "Событие уже canceled/completed")
+        (status = 204, description = "Event canceled successfully"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Event not found or you are not the creator"),
+        (status = 409, description = "Conflict: completed events cannot be canceled"),
+        (status = 500, description = "Server error: failed to cancel event")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -638,7 +687,7 @@ pub async fn cancel_event(
     if matches!(event.status, EventStatus::Completed) {
         return Err((
             StatusCode::CONFLICT,
-            "completed event cannot be canceled".to_string(),
+            "Completed events cannot be canceled.".to_string(),
         ));
     }
 
@@ -668,14 +717,15 @@ pub async fn cancel_event(
 #[utoipa::path(
     get,
     path = "/events/{id}/participants",
-    summary = "Участники события",
-    description = "Возвращает список участников из user_events: user_id, role, response_status.",
-    params(("id" = Uuid, Path, description = "ID события")),
+    summary = "Get event participants",
+    description = "Returns list of event participants with their response status.",
+    params(("id" = Uuid, Path, description = "Event ID")),
     responses(
-        (status = 200, description = "Список участников", body = [ParticipantResponse]),
-        (status = 401, description = "Не авторизован"),
-        (status = 403, description = "Нет доступа"),
-        (status = 404, description = "Событие не найдено")
+        (status = 200, description = "Participants list retrieved successfully", body = [ParticipantResponse]),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 403, description = "Forbidden: you are not a participant in this event"),
+        (status = 404, description = "Event not found"),
+        (status = 500, description = "Server error: failed to retrieve participants")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -695,14 +745,15 @@ pub async fn get_event_participants(
 #[utoipa::path(
     post,
     path = "/events/{id}/accept",
-    summary = "Принять приглашение в событие",
-    description = "Только participant со статусом pending. Переводит в accepted, ставит busyday. Если все участники accepted, событие становится confirmed.",
-    params(("id" = Uuid, Path, description = "ID события")),
+    summary = "Accept event invitation",
+    description = "Accepts event invitation. Participant must have pending status. Reserves the date if all others accept.",
+    params(("id" = Uuid, Path, description = "Event ID")),
     responses(
-        (status = 200, description = "Приглашение принято", body = EventResponse),
-        (status = 401, description = "Не авторизован"),
-        (status = 404, description = "Событие или участник не найден"),
-        (status = 409, description = "День уже занят или статус не pending")
+        (status = 200, description = "Invitation accepted successfully", body = EventResponse),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Event not found or you are not a pending participant"),
+        (status = 409, description = "Conflict: selected day is already busy or invitation already responded"),
+        (status = 500, description = "Server error: failed to accept invitation")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -719,12 +770,12 @@ pub async fn accept_event(
         .one(&tx)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "event not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "Event not found.".to_string()))?;
 
     if matches!(event.status, EventStatus::Canceled | EventStatus::Completed) {
         return Err((
             StatusCode::CONFLICT,
-            "event already canceled/completed".to_string(),
+            "This event has already been completed or canceled.".to_string(),
         ));
     }
 
@@ -738,7 +789,7 @@ pub async fn accept_event(
         .map_err(internal_error)?
         .ok_or((
             StatusCode::NOT_FOUND,
-            "pending participant not found".to_string(),
+            "You are not a pending participant in this event.".to_string(),
         ))?;
 
     ensure_day_is_free(&tx, me, event.date).await?;
@@ -780,13 +831,15 @@ pub async fn accept_event(
 #[utoipa::path(
     post,
     path = "/events/{id}/decline",
-    summary = "Отклонить приглашение в событие",
-    description = "Только participant со статусом pending/accepted. Ставит declined, удаляет busyday участника. Если событие на двоих, событие переводится в canceled.",
-    params(("id" = Uuid, Path, description = "ID события")),
+    summary = "Decline event invitation",
+    description = "Declines event invitation. Frees the date. If this is the last participant, event is canceled.",
+    params(("id" = Uuid, Path, description = "Event ID")),
     responses(
-        (status = 204, description = "Приглашение отклонено"),
-        (status = 401, description = "Не авторизован"),
-        (status = 404, description = "Событие или участник не найден")
+        (status = 204, description = "Invitation declined successfully"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 404, description = "Event not found or you are not a participant"),
+        (status = 409, description = "Conflict: event is already completed/canceled"),
+        (status = 500, description = "Server error: failed to decline invitation")
     ),
     security(("bearer_auth" = [])),
     tag = "Events"
@@ -803,12 +856,12 @@ pub async fn decline_event(
         .one(&tx)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "event not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "Event not found.".to_string()))?;
 
     if matches!(event.status, EventStatus::Canceled | EventStatus::Completed) {
         return Err((
             StatusCode::CONFLICT,
-            "event already canceled/completed".to_string(),
+            "This event has already been completed or canceled.".to_string(),
         ));
     }
 
@@ -824,7 +877,7 @@ pub async fn decline_event(
         .one(&tx)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "participant not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "You are not a participant in this event.".to_string()))?;
 
     let mut participant_active = participant.into_active_model();
     participant_active.response_status = Set(UserEventResponse::Declined);
@@ -904,7 +957,7 @@ async fn load_event_response(
         .one(db)
         .await
         .map_err(internal_error)?
-        .ok_or((StatusCode::NOT_FOUND, "event not found".to_string()))?;
+        .ok_or((StatusCode::NOT_FOUND, "Event not found.".to_string()))?;
 
     let participants = load_participants(db, event_id).await?;
 
@@ -927,6 +980,8 @@ async fn load_participants(
     db: &DatabaseConnection,
     event_id: Uuid,
 ) -> Result<Vec<ParticipantResponse>, (StatusCode, String)> {
+    use crate::entities::User;
+
     let rows = UserEvent::find()
         .filter(UserEventColumn::EventId.eq(event_id))
         .order_by_asc(UserEventColumn::UserId)
@@ -934,14 +989,20 @@ async fn load_participants(
         .await
         .map_err(internal_error)?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| ParticipantResponse {
-            user_id: row.user_id,
-            role: row.role.to_string(),
-            response_status: row.response_status.to_string(),
-        })
-        .collect())
+    let mut participants = Vec::new();
+    for row in rows {
+        if let Ok(Some(user)) = User::find_by_id(row.user_id).one(db).await {
+            participants.push(ParticipantResponse {
+                user_id: row.user_id,
+                username: user.username,
+                avatar_url: user.avatar_url,
+                bio: user.bio,
+                role: row.role.to_string(),
+                response_status: row.response_status.to_string(),
+            });
+        }
+    }
+    Ok(participants)
 }
 
 async fn accepted_event_ids(
@@ -974,7 +1035,7 @@ async fn ensure_day_is_free<C: ConnectionTrait>(
     if exists {
         return Err((
             StatusCode::CONFLICT,
-            "selected day is already busy".to_string(),
+            "This date is already reserved.".to_string(),
         ));
     }
 
@@ -1009,17 +1070,17 @@ async fn are_users_accepted_friends(
 
 fn parse_date(value: &str) -> Result<NaiveDate, (StatusCode, String)> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid date".to_string()))
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid date format. Use YYYY-MM-DD.".to_string()))
 }
 
 fn map_db_constraint_error(err: sea_orm::DbErr) -> (StatusCode, String) {
     let message = err.to_string();
     if message.contains("unique") || message.contains("duplicate key") {
-        return (StatusCode::CONFLICT, message);
+        return (StatusCode::CONFLICT, "This date is already reserved.".to_string());
     }
     internal_error(err)
 }
 
-fn internal_error<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+fn internal_error<E: std::fmt::Display>(_e: E) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
 }

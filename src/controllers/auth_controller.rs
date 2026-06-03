@@ -32,7 +32,10 @@ pub fn router() -> Router<DatabaseConnection> {
     path = "/auth/register",
     request_body = AuthRequestBody,
     responses(
-        (status = 201, description = "User created")
+        (status = 201, description = "User created successfully"),
+        (status = 400, description = "Validation error: missing username or password"),
+        (status = 409, description = "Username already exists: 'You already have an account, please log in'"),
+        (status = 500, description = "Server error: hashing or database error")
     )
 )]
 pub async fn register(
@@ -42,16 +45,30 @@ pub async fn register(
     if body.username.trim().is_empty() || body.password.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "username and password required".to_string(),
+            "Please enter both username and password.".to_string(),
         ));
     }
+
+    let existing_user = User::find()
+        .filter(user::Column::Username.eq(&body.username))
+        .one(&db_connection)
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to register. Please try again.".to_string()))?;
+
+    if existing_user.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "This username is already taken. Please choose another.".to_string(),
+        ));
+    }
+
     let salt = SaltString::generate(&mut OsRng);
     let password_hash = Argon2::default()
         .hash_password(body.password.as_bytes(), &salt)
         .map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "hashing failed".to_string(),
+                "Failed to secure your password. Please try again.".to_string(),
             )
         })?
         .to_string();
@@ -61,13 +78,8 @@ pub async fn register(
         password_hash: Set(password_hash),
         ..Default::default()
     };
-    let _ = active.insert(&db_connection).await.map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("duplicate key") || msg.contains("unique") {
-            (StatusCode::CONFLICT, "username already exists".to_string())
-        } else {
-            (StatusCode::INTERNAL_SERVER_ERROR, msg)
-        }
+    let _ = active.insert(&db_connection).await.map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create account. Please try again.".to_string())
     })?;
     Ok(StatusCode::CREATED)
 }
@@ -78,7 +90,9 @@ pub async fn register(
     request_body = LoginRequestBody,
     responses(
         (status = 200, description = "Login successful", body = LoginResponse),
-        (status = 401, description = "Invalid credentials")
+        (status = 400, description = "Validation error: missing username or password"),
+        (status = 401, description = "Unauthorized: 'User not found' or 'Invalid password'"),
+        (status = 500, description = "Server error: database or hash verification error")
     )
 )]
 pub async fn login(
@@ -88,7 +102,7 @@ pub async fn login(
     if body.username.trim().is_empty() || body.password.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "username and password required".to_string(),
+            "Please enter both username and password.".to_string(),
         ));
     }
 
@@ -96,27 +110,27 @@ pub async fn login(
         .filter(user::Column::Username.eq(body.username))
         .one(&db_connection)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Login failed. Please try again.".to_string()))?;
 
     let Some(model) = model else {
-        return Err((StatusCode::UNAUTHORIZED, "invalid credentials".to_string()));
+        return Err((StatusCode::UNAUTHORIZED, "Invalid username or password.".to_string()));
     };
 
     let parsed_hash = PasswordHash::new(&model.password_hash).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "invalid password hash".to_string(),
+            "Login failed. Please try again.".to_string(),
         )
     })?;
 
     Argon2::default()
         .verify_password(body.password.as_bytes(), &parsed_hash)
-        .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid credentials".to_string()))?;
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid username or password.".to_string()))?;
 
     let access_token = create_access_jwt(model.id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate token. Please try again.".to_string()))?;
     let refresh_issue = create_refresh_jwt(model.id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate token. Please try again.".to_string()))?;
 
     persist_refresh_token(
         &db_connection,
@@ -124,7 +138,8 @@ pub async fn login(
         model.id,
         refresh_issue.expires_at,
     )
-    .await?;
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Login failed. Please try again.".to_string()))?;
 
     Ok(Json(LoginResponse {
         access_token,
@@ -143,8 +158,9 @@ pub async fn login(
     path = "/auth/refresh",
     request_body = RefreshTokenRequest,
     responses(
-        (status = 200, description = "New token pair", body = RefreshTokenResponse),
-        (status = 401, description = "Invalid refresh token")
+        (status = 200, description = "New token pair issued", body = RefreshTokenResponse),
+        (status = 401, description = "Unauthorized: invalid, revoked, or expired refresh token"),
+        (status = 500, description = "Server error: database error")
     )
 )]
 pub async fn refresh(
@@ -154,14 +170,14 @@ pub async fn refresh(
     let payload = verify_refresh_jwt(&body.refresh_token).map_err(|_| {
         (
             StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
+            "Your session has expired. Please log in again.".to_string(),
         )
     })?;
 
     let user_id = Uuid::parse_str(&payload.sub).map_err(|_| {
         (
             StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
+            "Your session has expired. Please log in again.".to_string(),
         )
     })?;
 
@@ -170,13 +186,13 @@ pub async fn refresh(
         .as_ref()
         .ok_or((
             StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
+            "Your session has expired. Please log in again.".to_string(),
         ))
         .and_then(|v| {
             Uuid::parse_str(v).map_err(|_| {
                 (
                     StatusCode::UNAUTHORIZED,
-                    "invalid refresh token".to_string(),
+                    "Your session has expired. Please log in again.".to_string(),
                 )
             })
         })?;
@@ -184,13 +200,13 @@ pub async fn refresh(
     let user_exists = User::find_by_id(user_id)
         .one(&db_connection)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to refresh session. Please try again.".to_string()))?
         .is_some();
 
     if !user_exists {
         return Err((
             StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
+            "Your session has expired. Please log in again.".to_string(),
         ));
     }
 
@@ -198,26 +214,27 @@ pub async fn refresh(
         .filter(RefreshTokenColumn::UserId.eq(user_id))
         .one(&db_connection)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to refresh session. Please try again.".to_string()))?
         .ok_or((
             StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
+            "Your session has expired. Please log in again.".to_string(),
         ))?;
 
     if active_token.revoked_at.is_some() || active_token.expires_at < Utc::now() {
         return Err((
             StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
+            "Your session has expired. Please log in again.".to_string(),
         ));
     }
 
-    revoke_refresh_token(&db_connection, jti).await?;
+    revoke_refresh_token(&db_connection, jti).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to refresh session. Please try again.".to_string()))?;
 
     let access_token = create_access_jwt(user_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to refresh session. Please try again.".to_string()))?;
 
     let refresh_issue = create_refresh_jwt(user_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to refresh session. Please try again.".to_string()))?;
 
     persist_refresh_token(
         &db_connection,
@@ -225,7 +242,8 @@ pub async fn refresh(
         user_id,
         refresh_issue.expires_at,
     )
-    .await?;
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to refresh session. Please try again.".to_string()))?;
 
     Ok(Json(RefreshTokenResponse {
         access_token,
@@ -238,8 +256,9 @@ pub async fn refresh(
     path = "/auth/logout",
     request_body = RefreshTokenRequest,
     responses(
-        (status = 204, description = "Refresh token revoked"),
-        (status = 401, description = "Invalid refresh token")
+        (status = 204, description = "Refresh token revoked successfully"),
+        (status = 401, description = "Unauthorized: invalid or malformed refresh token"),
+        (status = 500, description = "Server error: database error")
     )
 )]
 pub async fn logout(
@@ -249,7 +268,7 @@ pub async fn logout(
     let payload = verify_refresh_jwt(&body.refresh_token).map_err(|_| {
         (
             StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
+            "Invalid token. Please log in again.".to_string(),
         )
     })?;
     let jti = payload
@@ -257,18 +276,19 @@ pub async fn logout(
         .as_ref()
         .ok_or((
             StatusCode::UNAUTHORIZED,
-            "invalid refresh token".to_string(),
+            "Invalid token. Please log in again.".to_string(),
         ))
         .and_then(|v| {
             Uuid::parse_str(v).map_err(|_| {
                 (
                     StatusCode::UNAUTHORIZED,
-                    "invalid refresh token".to_string(),
+                    "Invalid token. Please log in again.".to_string(),
                 )
             })
         })?;
 
-    revoke_refresh_token(&db_connection, jti).await?;
+    revoke_refresh_token(&db_connection, jti).await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to logout. Please try again.".to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -288,7 +308,7 @@ async fn persist_refresh_token(
     active
         .insert(db_connection)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save session. Please try again.".to_string()))?;
     Ok(())
 }
 
@@ -299,14 +319,14 @@ async fn revoke_refresh_token(
     if let Some(row) = RefreshToken::find_by_id(token_id)
         .one(db_connection)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to revoke token. Please try again.".to_string()))?
     {
         let mut active: RefreshTokenActiveModel = row.into();
         active.revoked_at = Set(Some(Utc::now().into()));
         active
             .update(db_connection)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to revoke token. Please try again.".to_string()))?;
     }
     Ok(())
 }

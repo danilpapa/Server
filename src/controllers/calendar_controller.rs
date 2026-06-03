@@ -30,14 +30,15 @@ pub fn router() -> Router<DatabaseConnection> {
 #[utoipa::path(
     post,
     path = "/calendar/is_busy",
-    summary = "Проверить занятость дня",
-    description = "Проверяет, занят ли день `date` у пользователя `id`. Доступ: сам пользователь или принятый друг.",
+    summary = "Check if date is busy",
+    description = "Checks if user is busy on the specified date. Access: self or accepted friend only.",
     request_body = IsBusyRequest,
     responses(
-        (status = 200, description = "Результат проверки", body = bool),
-        (status = 400, description = "Некорректная дата"),
-        (status = 401, description = "Не авторизован"),
-        (status = 403, description = "Нет доступа")
+        (status = 200, description = "Availability status returned", body = bool),
+        (status = 400, description = "Validation error: invalid date format (use YYYY-MM-DD)"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 403, description = "Forbidden: you can only check your own or accepted friend's availability"),
+        (status = 500, description = "Server error: failed to check date availability")
     ),
     security(("bearer_auth" = [])),
     tag = "Calendar"
@@ -49,7 +50,7 @@ pub async fn is_busy(
 ) -> Result<Json<bool>, (StatusCode, String)> {
     let me = auth.user_id;
     if me != payload.id && !are_users_accepted_friends(&db, me, payload.id).await? {
-        return Err((StatusCode::FORBIDDEN, "access denied".to_string()));
+        return Err((StatusCode::FORBIDDEN, "You can only check your own or accepted friend's availability.".to_string()));
     }
 
     let date = parse_one_date(&payload.date)?;
@@ -67,13 +68,14 @@ pub async fn is_busy(
 #[utoipa::path(
     get,
     path = "/users/me/calendar",
-    summary = "Мой календарь",
-    description = "Возвращает календарь текущего пользователя за диапазон from..to: busy_days, pending_invites и past_events.",
+    summary = "Get my calendar",
+    description = "Returns current user's calendar within date range: busy days, pending invites, and past events.",
     params(CalendarQuery),
     responses(
-        (status = 200, description = "Данные календаря", body = CalendarResponse),
-        (status = 400, description = "Некорректный диапазон дат"),
-        (status = 401, description = "Не авторизован")
+        (status = 200, description = "Calendar data retrieved successfully", body = CalendarResponse),
+        (status = 400, description = "Validation error: invalid date range or format (use YYYY-MM-DD, from <= to)"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 500, description = "Server error: failed to retrieve calendar")
     ),
     security(("bearer_auth" = [])),
     tag = "Calendar"
@@ -90,17 +92,18 @@ pub async fn get_my_calendar(
 #[utoipa::path(
     get,
     path = "/users/{user_id}/calendar",
-    summary = "Календарь пользователя",
-    description = "Возвращает календарь пользователя за диапазон from..to: busy_days, pending_invites и past_events. Доступ: сам пользователь или принятый друг.",
+    summary = "Get user calendar",
+    description = "Returns user's calendar within date range. Access: self or accepted friend only.",
     params(
-        ("user_id" = Uuid, Path, description = "ID пользователя"),
+        ("user_id" = Uuid, Path, description = "User ID"),
         CalendarQuery
     ),
     responses(
-        (status = 200, description = "Данные календаря", body = CalendarResponse),
-        (status = 400, description = "Некорректный диапазон дат"),
-        (status = 401, description = "Не авторизован"),
-        (status = 403, description = "Нет доступа")
+        (status = 200, description = "Calendar data retrieved successfully", body = CalendarResponse),
+        (status = 400, description = "Validation error: invalid date range or format (use YYYY-MM-DD, from <= to)"),
+        (status = 401, description = "Unauthorized: invalid or missing authentication token"),
+        (status = 403, description = "Forbidden: you can only view your own or accepted friend's calendar"),
+        (status = 500, description = "Server error: failed to retrieve calendar")
     ),
     security(("bearer_auth" = [])),
     tag = "Calendar"
@@ -113,7 +116,7 @@ pub async fn get_user_calendar(
 ) -> Result<Json<CalendarResponse>, (StatusCode, String)> {
     let me = auth.user_id;
     if me != user_id && !are_users_accepted_friends(&db, me, user_id).await? {
-        return Err((StatusCode::FORBIDDEN, "access denied".to_string()));
+        return Err((StatusCode::FORBIDDEN, "You can only view your own or accepted friend's calendar.".to_string()));
     }
 
     Ok(Json(build_calendar_response(&db, user_id, &query).await?))
@@ -230,7 +233,7 @@ fn parse_date_range(from: &str, to: &str) -> Result<(NaiveDate, NaiveDate), (Sta
     if from_date > to_date {
         return Err((
             StatusCode::BAD_REQUEST,
-            "`from` must be <= `to`".to_string(),
+            "Start date must be before or equal to end date.".to_string(),
         ));
     }
 
@@ -241,11 +244,11 @@ fn parse_one_date(value: &str) -> Result<NaiveDate, (StatusCode, String)> {
     NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
-            format!("invalid date format `{value}`, expected YYYY-MM-DD"),
+            "Invalid date format. Use YYYY-MM-DD.".to_string(),
         )
     })
 }
 
-fn internal_error<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+fn internal_error<E: std::fmt::Display>(_e: E) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong. Please try again.".to_string())
 }
